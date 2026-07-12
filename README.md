@@ -1,82 +1,284 @@
 # MCP Obsidian Server
 
-An [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows LLMs to interact with your Obsidian vault via the [Local REST API](https://github.com/codemirror/obsidian-local-rest-api).
+An MCP (Model Context Protocol) server that enables AI assistants to securely interact with an Obsidian vault through the Obsidian Local REST API.
 
-This server enables AI agents (like Claude Desktop and Cursor) to read, write, search, and analyze your personal knowledge base with built-in stability features like circuit breakers and exponential backoff.
+The server exposes a collection of tools for searching, reading, creating, modifying, and analyzing notes while incorporating resilience patterns such as retry mechanisms, circuit breakers, and input validation.
 
-## 🚀 Features
-*   **Full File Management**: List, read, create, append, and patch notes.
-*   **Powerful Search**: Supports both simple text queries and complex JSON-logic searches.
-*   **Vault Analytics**: Tools to calculate link density, identify orphaned notes, and track top tags.
-*   **Resilience**: 
-    *   **Retry Logic**: Exponential backoff with jitter for transient network errors.
-    *   **Circuit Breaker**: Automatically pauses requests if the Obsidian API becomes unreachable to prevent resource exhaustion.
+> **Status:** Published on PyPI | Engineering Prototype
 
-## 📋 Prerequisites
-1.  **Obsidian** must be open with the vault you wish to access.
-2.  **Local REST API Plugin**:
-    *   Install it via Obsidian Community Plugins.
-    *   Enable the plugin and toggle "Enable Northbound" if required.
-    *   Copy your **API Key** from the plugin settings.
-    *   Note your port (default is `27124`).
+---
 
-## 🛠 Installation
+## Why This Project?
 
-### For Claude Desktop (Recommended)
-The easiest way to run this server in Claude Desktop is using `uvx`. This automatically fetches the latest version directly from PyPI and runs it securely in an isolated environment.
+Modern AI assistants become significantly more useful when they can access a user's personal knowledge base.
 
-1. Open your Claude Desktop configuration file:
-   - **Mac:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-2. Add the following configuration (replace `your_api_key_here` with your actual Obsidian REST API key):
-```json
-{
-  "mcpServers": {
-    "mcp-obsidian": {
-      "command": "uvx",
-      "args": [
-        "mcp-obsidian-sindhutsundupalli"
-      ],
-      "env": {
-        "OBSIDIAN_API_KEY": "your_api_key_here",
-        "OBSIDIAN_HOST": "127.0.0.1",
-        "OBSIDIAN_PORT": "27124",
-        "OBSIDIAN_PROTOCOL": "http"
-      }
-    }
-  }
-}
+Obsidian stores valuable notes, documentation, and project information, but interacting with it programmatically often requires direct API integration.
+
+This project implements an MCP server that allows any MCP-compatible AI client to safely interact with an Obsidian vault through a standardized tool interface.
+
+Beyond providing file operations, the project also explores engineering practices required for building reliable AI infrastructure, including fault tolerance, validation, and service health monitoring.
+
+---
+
+## Features
+
+### Vault Operations
+
+- List vault files
+- Browse directories
+- Read notes
+- Read multiple notes in batch
+
+---
+
+### Search
+
+- Keyword search
+- Structured JSON search
+- Search and summarize notes
+
+---
+
+###  Note Management
+
+- Create notes
+- Update notes
+- Append content
+- Patch markdown sections
+- Delete notes
+
+---
+
+###  Vault Analytics
+
+- Total notes
+- Average link density
+- Most common tags
+- Orphaned notes detection
+
+---
+
+###  Health Monitoring
+
+- Connection health check
+- Latency reporting
+- Circuit breaker status
+
+---
+
+###  Reliability Features
+
+- Exponential backoff retries
+- Circuit breaker
+- Input validation
+- Standardized success/error responses
+
+---
+
+## Supported MCP Tools
+
+| Category | Tools |
+|----------|------|
+| File Operations | list_files_in_vault, list_files_in_dir, get_file_contents, batch_get_file_contents |
+| Search | simple_search, complex_search, search_and_summarize |
+| Note Management | create_note, append_content, put_content, patch_content, delete_file |
+| Analytics | get_vault_stats |
+| Health | check_connection |
+
+---
+
+# Architecture
+
+```text
+                 MCP Client
+                      │
+                      ▼
+              FastMCP Server
+                      │
+        ┌─────────────┼─────────────┐
+        ▼             ▼             ▼
+ Validation     Circuit Breaker    Retry Layer
+        │             │             │
+        └─────────────┼─────────────┘
+                      ▼
+             Obsidian API Wrapper
+                      │
+                      ▼
+         Obsidian Local REST API
+                      │
+                      ▼
+               Obsidian Vault
 ```
-3. Completely restart Claude Desktop.
 
-### For Cursor / Terminal (Global Installation)
-If you want to use the server in Cursor or from your command line, you can install it globally via pip:
+---
+
+# Repository Structure
+
+```text
+MCP/
+
+├── Dockerfile
+├── pyproject.toml
+├── requirements.txt
+├── README.md
+│
+└── src/
+    └── mcp_obsidian/
+        ├── server.py
+        ├── APIWrapper.py
+        ├── main.py
+        └── test_client.py
+```
+
+---
+
+# Getting Started
+
+## Clone the Repository
+
+```bash
+git clone https://github.com/<username>/MCP.git
+
+cd MCP
+```
+
+---
+
+## Install
+
+```bash
+pip install -r requirements.txt
+```
+
+or
+
+```bash
+pip install .
+```
+
+---
+
+## Environment Variables
+
+Create a `.env` file.
+
+```env
+OBSIDIAN_API_KEY=
+
+OBSIDIAN_HOST=127.0.0.1
+
+OBSIDIAN_PROTOCOL=https
+
+OBSIDIAN_PORT=27124
+```
+
+---
+
+## Run
+
+```bash
+python -m mcp_obsidian
+```
+
+---
+
+## Docker
+
+Build
+
+```bash
+docker build -t mcp-obsidian .
+```
+
+Run
+
+```bash
+docker run \
+-e OBSIDIAN_API_KEY=... \
+mcp-obsidian
+```
+
+---
+
+# Tech Stack
+
+| Category | Technology |
+|----------|------------|
+| Language | Python 3.11 |
+| MCP Framework | FastMCP |
+| HTTP Client | httpx |
+| Validation | Pydantic |
+| Configuration | python-dotenv |
+| Packaging | PyPI |
+| Containerization | Docker |
+
+---
+
+# Reliability Features
+
+Unlike a basic API wrapper, this project includes several mechanisms designed to improve robustness.
+
+### Retry with Exponential Backoff
+
+Transient failures such as network interruptions or HTTP 429/503 responses are retried automatically using exponential backoff with jitter.
+
+---
+
+### Circuit Breaker
+
+Repeated failures temporarily open the circuit to prevent unnecessary API requests until the service recovers.
+
+---
+
+### Input Validation
+
+Pydantic models validate incoming requests before interacting with the Obsidian API.
+
+---
+
+### Health Checks
+
+The server exposes a health endpoint that reports:
+
+- connection status
+- latency
+- vault size
+- circuit breaker state
+
+---
+
+# Current Limitations
+
+- Requires the Obsidian Local REST API plugin
+- Designed for a single vault
+- No authentication beyond the Obsidian API key
+- No caching layer
+- No role-based permissions
+
+---
+
+# Future Improvements
+
+- Vault indexing
+- Semantic search
+- Embedding support
+- Streaming responses
+- Metrics dashboard
+- Multi-vault support
+- Authentication middleware
+
+---
+
+# Published Package
+
+The server is available as a PyPI package.
+
 ```bash
 pip install mcp-obsidian-sindhutsundupalli
 ```
 
-Once installed, you can configure it in Cursor Settings (Features > MCP > Add New) using this exact command:
-```bash
-uvx --env OBSIDIAN_API_KEY=your_key_here mcp-obsidian-sindhutsundupalli
-```
-
-## 🧰 Available Tools
-| Tool | Description |
-| :--- | :--- |
-| `list_files_in_vault` | Returns a list of all files in your vault. |
-| `get_file_contents` | Fetches the full text content of a specific note. |
-| `simple_search` | Searches the vault for a specific string. |
-| `create_note` | Creates a new note with specified content. |
-| `get_vault_stats` | Provides statistics on links, tags, and orphaned files. |
-| `append_content` | Adds text to the end of an existing note. |
-| `check_connection` | Diagnostic tool to verify the connection to Obsidian. |
-
-## 🛡️ Safety & Reliability
-This server implements a **Circuit Breaker** pattern. If the connection to Obsidian fails 3 times consecutively, the circuit opens for 10 seconds, immediately rejecting further calls to allow the service to recover. This prevents the LLM from getting stuck in a loop of failed requests.
-
-## 📝 License
-MIT - Developed by Siva Sindhuja
-```
-
-
 ---
+
+# Documentation
+
+Detailed documentation covering the architecture, engineering decisions, and implementation details will be published separately.
