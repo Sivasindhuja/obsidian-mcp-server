@@ -1,3 +1,5 @@
+from urllib import response
+
 import httpx
 import urllib.parse
 import os
@@ -94,12 +96,9 @@ class Obsidian():
     
     @retry_with_backoff(max_retries=3, base_delay=0.5, max_delay=5)
     async def _safe_call(self, coro):
-        try:
-            return await coro
-        except httpx.HTTPStatusError as e:
-            raise Exception(f"HTTP error: {e.response.text}")
-        except httpx.RequestError as e:
-            raise Exception(f"Request failed: {str(e)}")
+    # Let the decorator handle the httpx exceptions
+        response = await coro
+        return response
 
     # ========================
     # FILE OPERATIONS
