@@ -1,4 +1,5 @@
-fastmcp
-httpx
-python-dotenv
-pydantic
+fastmcp>=3.4,<4
+httpx>=0.27,<1
+mcp>=1.24,<2
+pydantic>=2.7,<3
+python-dotenv>=1.0,<2
