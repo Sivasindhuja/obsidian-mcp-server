@@ -202,6 +202,3 @@ def fit_json_to_bytes(value: Any, max_bytes: int) -> tuple[Any, bool]:
     if shrunk is _MISSING:
         return None, True
     return shrunk, True
-
-
-
