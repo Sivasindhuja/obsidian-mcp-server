@@ -61,9 +61,11 @@ def normalize_vault_path(path: str, *, allow_root: bool = False) -> str:
         if any(part == ".." for part in parts):
             raise PathValidationError("path traversal is not allowed")
 
-    # Use the once-decoded form so ordinary percent-escapes in filenames are
-    # treated literally, while encoded traversal is still rejected above.
-    normalized = unquote(raw).replace("\\", "/")
+    # Keep the original percent escapes in the normalized path.  The forms
+    # above are decoded only for traversal checks; decoding here as well would
+    # make a literal filename such as ``100%20.md`` target ``100 .md`` after
+    # the URL is decoded once by the Obsidian API.
+    normalized = raw.replace("\\", "/")
     parts = [part for part in normalized.split("/") if part not in ("", ".")]
 
     if not parts and not allow_root:

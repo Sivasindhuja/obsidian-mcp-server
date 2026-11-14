@@ -10,11 +10,9 @@ import posixpath
 import re
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
-from urllib.parse import unquote
 
-_FENCED_CODE_RE = re.compile(
-    r"(?ms)^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$"
-)
+_FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+_FENCE_CLOSE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*$")
 _WIKI_LINK_RE = re.compile(r"(?<!!)\[\[([^\]]+)\]\]")
 _TAG_RE = re.compile(r"(?<![\w/#])#([A-Za-z0-9_][\w/-]*)")
 
@@ -25,10 +23,51 @@ def is_markdown(path: str) -> bool:
     return path.lower().endswith(_MARKDOWN_EXTENSIONS)
 
 
-def strip_fenced_code(content: str) -> str:
-    """Remove fenced code blocks so links/tags inside them are not counted."""
+def is_folder_entry(path: str) -> bool:
+    """Return True for directory entries in a vault listing.
 
-    return _FENCED_CODE_RE.sub("", content)
+    The Local REST API includes directories in its ``files`` array with a
+    trailing slash (for example ``somedirectory/``).  They are not files and
+    must not be counted as such.
+    """
+
+    return path.replace("\\", "/").endswith("/")
+
+
+def strip_fenced_code(content: str) -> str:
+    """Remove fenced code blocks so links/tags inside them are not counted.
+
+    A closing fence may be longer than the opening fence, as allowed by
+    Markdown; comparing the fence lengths rather than requiring an exact
+    backreference handles both backtick and tilde fences.
+    """
+
+    kept: list[str] = []
+    fence_character: str | None = None
+    fence_length = 0
+
+    for line in content.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if fence_character is None:
+            opening = _FENCE_OPEN_RE.match(body)
+            if opening:
+                marker = opening.group(1)
+                fence_character = marker[0]
+                fence_length = len(marker)
+                continue
+            kept.append(line)
+            continue
+
+        closing = _FENCE_CLOSE_RE.match(body)
+        if (
+            closing
+            and closing.group(1)[0] == fence_character
+            and len(closing.group(1)) >= fence_length
+        ):
+            fence_character = None
+            fence_length = 0
+
+    return "".join(kept)
 
 
 def extract_wiki_links(content: str) -> list[str]:
@@ -52,7 +91,9 @@ def _link_target(raw_target: str) -> str:
     """
 
     target = raw_target.split("|", 1)[0].split("#", 1)[0].strip()
-    return unquote(target).replace("\\", "/").strip()
+    # Obsidian writes wiki links literally.  Do not URL-decode the target here:
+    # a note named ``100%20.md`` is linked as ``[[100%20]]``, not ``[[100 ]]``.
+    return target.replace("\\", "/").strip()
 
 
 def _strip_markdown_extension(path: str) -> str:
@@ -96,15 +137,21 @@ def resolve_wiki_link(
     1. an explicit relative path (``./`` or ``../``) from the source folder;
     2. exact vault path (with or without a Markdown extension);
     3. a same-folder relative path;
-    4. a unique/ambiguous basename match.
+    4. a unique/ambiguous basename match for a bare target.
 
     Ambiguous basename matches return every candidate rather than falsely
-    reporting a note as orphaned.  Remaining limitations are documented in the
-    README.
+    reporting a note as orphaned.  Path-like targets never fall back to a
+    basename match.  Remaining limitations are documented in the README.
     """
 
     target = _link_target(raw_target)
-    if not target:
+    if not target or target in {".", ".."}:
+        return set()
+    if (
+        target.startswith("/")
+        or re.match(r"^[A-Za-z]:", target)
+        or any(ord(character) < 32 for character in target)
+    ):
         return set()
 
     source_dir = posixpath.dirname(source_path.replace("\\", "/"))
@@ -124,6 +171,12 @@ def resolve_wiki_link(
         for candidate in relative_candidates:
             if candidate in exact_paths:
                 return {exact_paths[candidate]}
+        return set()
+
+    # A path-like target that contains an upward segment is malformed unless it
+    # was handled as an explicit relative link above.  Do not normalise it and
+    # then fall back to a same-named note elsewhere in the vault.
+    if any(part == ".." for part in target.split("/")):
         return set()
 
     lowered = target.lower()
@@ -147,9 +200,13 @@ def resolve_wiki_link(
             if candidate in exact_paths:
                 return {exact_paths[candidate]}
 
-    basename = _strip_markdown_extension(
-        target.rsplit("/", 1)[-1]
-    ).lower()
+    # Basename fallback is only safe for a bare link target.  A missing
+    # folder-qualified target such as ``missing/Note`` must not silently
+    # resolve to ``elsewhere/Note.md``.
+    if "/" in target:
+        return set()
+
+    basename = _strip_markdown_extension(target).lower()
     matches = basename_paths.get(basename, [])
     return set(matches)
 
@@ -162,9 +219,11 @@ def compute_vault_stats(
 ) -> dict:
     """Compute link density, tags, and orphans for scanned notes."""
 
-    files = list(files)
+    files = [path for path in files if not is_folder_entry(path)]
     notes = [path for path in files if is_markdown(path)]
     scanned = notes[: max(1, int(max_files))]
+    read_notes = [note for note in scanned if isinstance(contents.get(note), str)]
+    unread_notes = [note for note in scanned if not isinstance(contents.get(note), str)]
 
     exact_paths, basename_paths = build_path_index(notes)
 
@@ -173,11 +232,8 @@ def compute_vault_stats(
     raw_outgoing_counts: dict[str, int] = defaultdict(int)
     tag_counter: Counter[str] = Counter()
 
-    for note in scanned:
-        content = contents.get(note)
-        if content is None:
-            continue
-
+    for note in read_notes:
+        content = contents[note]
         cleaned = strip_fenced_code(content)
         raw_links = extract_wiki_links(cleaned)
         raw_outgoing_counts[note] = len(raw_links)
@@ -192,7 +248,7 @@ def compute_vault_stats(
         tag_counter.update(extract_tags(cleaned))
 
     orphaned = []
-    for note in scanned:
+    for note in read_notes:
         has_outgoing = bool(outgoing_links.get(note)) or raw_outgoing_counts.get(
             note, 0
         ) > 0
@@ -201,12 +257,16 @@ def compute_vault_stats(
             orphaned.append(note)
 
     total_links = sum(raw_outgoing_counts.values())
-    avg_link_density = total_links / len(scanned) if scanned else 0.0
+    avg_link_density = total_links / len(read_notes) if read_notes else 0.0
 
     return {
         "total_files": len(files),
         "total_notes": len(notes),
         "notes_scanned": len(scanned),
+        "notes_read": len(read_notes),
+        "read_failures": len(unread_notes),
+        "unread_files_count": len(unread_notes),
+        "unread_files_sample": unread_notes[:10],
         "truncated": len(notes) > len(scanned),
         "avg_link_density": round(avg_link_density, 2),
         "top_tags": tag_counter.most_common(10),
@@ -217,7 +277,8 @@ def compute_vault_stats(
             "Inline code is not stripped. "
             "Ambiguous basename links mark all matching notes as linked. "
             "Frontmatter tags are not counted. Orphan detection only considers "
-            "links among scanned notes. Relative and folder-qualified "
-            "links are resolved on a best-effort basis."
+            "successfully read scanned notes. Unread notes are reported "
+            "separately and are never classified as orphaned. Relative and "
+            "folder-qualified links are resolved on a best-effort basis."
         ),
     }

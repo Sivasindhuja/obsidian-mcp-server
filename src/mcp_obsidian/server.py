@@ -8,9 +8,8 @@ import os
 import time
 from contextlib import asynccontextmanager
 from functools import wraps
-from typing import Any
+from typing import Annotated, Any, Literal
 
-import httpx
 from dotenv import load_dotenv
 
 # Must run before importing APIWrapper: APIWrapper resolves environment values
@@ -20,11 +19,35 @@ load_dotenv()
 from fastmcp import FastMCP  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
-from mcp_obsidian.APIWrapper import Obsidian, is_service_failure  # noqa: E402
+from mcp_obsidian.APIWrapper import (  # noqa: E402
+    Obsidian,
+    is_circuit_failure,
+    is_service_failure,
+)
 from mcp_obsidian.circuit_breaker import CircuitBreaker  # noqa: E402
+from mcp_obsidian.errors import InputValidationError, ObsidianMCPError  # noqa: E402
+from mcp_obsidian.limits import (  # noqa: E402
+    DEFAULT_MAX_BATCH_BYTES,
+    DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_MAX_SEARCH_BYTES,
+    DEFAULT_MAX_SUMMARY_BYTES,
+    MAX_MAX_BATCH_BYTES,
+    MAX_MAX_FILE_BYTES,
+    MAX_MAX_SEARCH_BYTES,
+    MAX_MAX_SUMMARY_BYTES,
+    env_float,
+    env_int,
+    fit_json_to_bytes,
+    json_bytes,
+    json_characters,
+    resolve_limit,
+    truncate_utf8,
+    utf8_len,
+)
 from mcp_obsidian.validation import normalize_vault_path  # noqa: E402
 from mcp_obsidian.vault_stats import (  # noqa: E402
     compute_vault_stats,
+    is_folder_entry,
     is_markdown,
 )
 
@@ -42,13 +65,17 @@ if not api_key:
 
 host = os.getenv("OBSIDIAN_HOST", "127.0.0.1")
 protocol = os.getenv("OBSIDIAN_PROTOCOL", "https")
-port = int(os.getenv("OBSIDIAN_PORT", "27124"))
+port = env_int("OBSIDIAN_PORT", 27124, 1, 65535)
 
 api = Obsidian(api_key=api_key, protocol=protocol, host=host, port=port)
 
 circuit = CircuitBreaker(
-    failure_threshold=int(os.getenv("OBSIDIAN_CIRCUIT_FAILURE_THRESHOLD", "3")),
-    recovery_time=float(os.getenv("OBSIDIAN_CIRCUIT_RECOVERY_TIME", "10")),
+    failure_threshold=env_int(
+        "OBSIDIAN_CIRCUIT_FAILURE_THRESHOLD", 3, 1, 100
+    ),
+    recovery_time=env_float(
+        "OBSIDIAN_CIRCUIT_RECOVERY_TIME", 10.0, 0.0, 3600.0
+    ),
 )
 
 DEFAULT_SEARCH_RESULTS = 20
@@ -107,6 +134,148 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return _clamp(value, minimum, maximum)
 
 
+def _count_matches(results: Any) -> int:
+    """Count match objects present in a simple-search result list."""
+
+    total = 0
+    if not isinstance(results, list):
+        return total
+    for item in results:
+        if isinstance(item, dict) and isinstance(item.get("matches"), list):
+            total += len(item["matches"])
+    return total
+
+
+def _read_limit(value: int | None) -> int:
+    return resolve_limit(
+        value,
+        "OBSIDIAN_MAX_FILE_BYTES",
+        DEFAULT_MAX_FILE_BYTES,
+        MAX_MAX_FILE_BYTES,
+    )
+
+
+def _batch_limit(value: int | None) -> int:
+    return resolve_limit(
+        value,
+        "OBSIDIAN_MAX_BATCH_BYTES",
+        DEFAULT_MAX_BATCH_BYTES,
+        MAX_MAX_BATCH_BYTES,
+    )
+
+
+def _search_limit(value: int | None) -> int:
+    return resolve_limit(
+        value,
+        "OBSIDIAN_MAX_SEARCH_BYTES",
+        DEFAULT_MAX_SEARCH_BYTES,
+        MAX_MAX_SEARCH_BYTES,
+    )
+
+
+def _summary_limit(value: int | None) -> int:
+    return resolve_limit(
+        value,
+        "OBSIDIAN_MAX_SUMMARY_BYTES",
+        DEFAULT_MAX_SUMMARY_BYTES,
+        MAX_MAX_SUMMARY_BYTES,
+    )
+
+
+async def _read_file(filepath: str, max_bytes: int | None):
+    """Call the wrapper while remaining compatible with older test doubles."""
+
+    if max_bytes is None:
+        return await api.get_file_contents(filepath)
+    try:
+        return await api.get_file_contents(filepath, max_bytes=max_bytes)
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return await api.get_file_contents(filepath)
+
+
+async def _read_file_with_etag(filepath: str, max_bytes: int | None):
+    """Call the etag wrapper while remaining compatible with older test doubles."""
+
+    if max_bytes is None:
+        return await api.get_file_contents_with_etag(filepath)
+    try:
+        return await api.get_file_contents_with_etag(
+            filepath, max_bytes=max_bytes
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return await api.get_file_contents_with_etag(filepath)
+
+
+async def _read_batch(
+    filepaths: list[str],
+    max_files: int,
+    max_bytes: int | None,
+    max_file_bytes: int | None,
+):
+    """Call the batch wrapper while remaining compatible with older fakes."""
+
+    kwargs: dict[str, Any] = {"max_files": max_files}
+    if max_bytes is not None:
+        kwargs["max_bytes"] = max_bytes
+    if max_file_bytes is not None:
+        kwargs["max_file_bytes"] = max_file_bytes
+    try:
+        return await api.get_batch_file_contents(filepaths, **kwargs)
+    except TypeError as exc:
+        if len(kwargs) == 1 or "unexpected keyword argument" not in str(exc):
+            raise
+        return await api.get_batch_file_contents(filepaths, max_files=max_files)
+
+
+def _search_metadata(
+    results: Any, total_results: int | None, file_limit: int
+) -> dict[str, Any]:
+    """Summarise file-level and match-level truncation from simple search.
+
+    Obsidian reports the number of files in the ``Total-Results`` header and
+    the number of matches per file in ``totalMatches``. Both can be larger than
+    what the API returned, so they are tracked independently.
+    """
+
+    result_list = results if isinstance(results, list) else []
+    files_returned = len(result_list)
+    if total_results is None:
+        files_truncated = files_returned >= file_limit
+    else:
+        files_truncated = total_results > files_returned
+
+    total_matches = 0
+    matches_returned = 0
+    for item in result_list:
+        if not isinstance(item, dict):
+            continue
+        matches = item.get("matches")
+        if not isinstance(matches, list):
+            matches = []
+        matches_returned += len(matches)
+
+        raw_total = item.get("totalMatches")
+        try:
+            per_file_total = int(raw_total)
+        except (TypeError, ValueError, OverflowError):
+            per_file_total = len(matches)
+        total_matches += max(len(matches), per_file_total)
+
+    matches_truncated = total_matches > matches_returned
+    return {
+        "returned": files_returned,
+        "files_truncated": files_truncated,
+        "total_matches": total_matches,
+        "matches_returned": matches_returned,
+        "matches_truncated": matches_truncated,
+        "truncated": files_truncated or matches_truncated,
+    }
+
+
 # ========================
 # CIRCUIT BREAKER DECORATOR
 # ========================
@@ -150,23 +319,19 @@ def circuit_protected(func):
             circuit.record_cancelled()
             raise
         except Exception as exc:  # map expected errors into MCP responses
-            counts_as_failure = getattr(exc, "counts_as_circuit_failure", True)
-            if (
-                isinstance(exc, httpx.HTTPStatusError)
-                and 400 <= exc.response.status_code < 500
-                and exc.response.status_code != 429
-            ):
-                # A bad request is a client error, not evidence that the
-                # service is down. 429 is retried and surfaces as
-                # TransientAPIError instead.
-                counts_as_failure = False
-            if counts_as_failure:
+            if is_circuit_failure(exc):
                 circuit.record_failure()
+                circuit_outcome = "failure"
             else:
-                # Conflicts and validation failures mean the service is healthy.
-                circuit.record_success()
+                # Local validation, auth/client errors, and write conflicts
+                # are neutral: they neither prove nor disprove service health.
+                circuit.record_neutral()
+                circuit_outcome = "neutral"
 
             snapshot = circuit.snapshot()
+            # Expected, typed failures are actionable without a traceback.
+            # Unexpected exceptions get one so operators can diagnose them.
+            unexpected = not isinstance(exc, ObsidianMCPError)
             logger.warning(
                 "tool_failed",
                 extra={
@@ -174,9 +339,11 @@ def circuit_protected(func):
                     "tool": func.__name__,
                     "status": getattr(exc, "status", "failed"),
                     "circuit_state": snapshot["state"],
+                    "circuit_outcome": circuit_outcome,
                     "failure_count": snapshot["failure_count"],
                     "duration_ms": round((time.monotonic() - started) * 1000, 2),
                 },
+                exc_info=exc if unexpected else None,
             )
             return error(
                 {
@@ -187,13 +354,20 @@ def circuit_protected(func):
                 }
             )
 
-        circuit.record_success()
+        if isinstance(result, dict) and result.get("success") is False:
+            circuit.record_neutral()
+            circuit_outcome = "neutral"
+        else:
+            circuit.record_success()
+            circuit_outcome = "success"
+
         logger.info(
             "tool_completed",
             extra={
                 "event": "tool_completed",
                 "tool": func.__name__,
                 "circuit_state": circuit.state,
+                "circuit_outcome": circuit_outcome,
                 "duration_ms": round((time.monotonic() - started) * 1000, 2),
             },
         )
@@ -249,29 +423,103 @@ async def list_note_titles() -> dict:
 
 @mcp.tool()
 @circuit_protected
-async def get_file_contents(input: FilePathInput, include_etag: bool = False) -> dict:
+async def get_file_contents(
+    input: FilePathInput,
+    include_etag: bool = False,
+    max_bytes: Annotated[int, Field(ge=1, le=MAX_MAX_FILE_BYTES)] | None = None,
+) -> dict:
     """Read a UTF-8 text note. Binary attachments are rejected, not decoded as text.
 
     Set ``include_etag`` to receive the ETag/version needed for conditional writes.
+    ``max_bytes`` bounds the returned text; truncation is reported explicitly.
     """
 
     filepath = normalize_vault_path(input.filepath)
+    limit = _read_limit(max_bytes)
     if include_etag:
-        content, etag = await api.get_file_contents_with_etag(filepath)
-        return success({"filepath": filepath, "content": content, "etag": etag})
-    return success(await api.get_file_contents(filepath))
+        content, etag = await _read_file_with_etag(filepath, max_bytes)
+        data = {"filepath": filepath, "content": str(content), "etag": etag}
+    else:
+        content = await _read_file(filepath, max_bytes)
+        data = str(content)
+
+    bounded, post_truncated = truncate_utf8(str(content), limit)
+    metadata = getattr(content, "metadata", {})
+    bytes_truncated = (
+        bool(metadata.get("bytes_truncated", metadata.get("truncated")))
+        or post_truncated
+    )
+    if include_etag:
+        data["content"] = bounded
+    else:
+        data = bounded
+    return success(
+        data,
+        returned_bytes=utf8_len(bounded),
+        returned_characters=len(bounded),
+        max_bytes=limit,
+        truncated=bytes_truncated,
+        bytes_truncated=bytes_truncated,
+    )
 
 
 @mcp.tool()
 @circuit_protected
 async def batch_get_file_contents(
-    filepaths: list[str], max_files: int = DEFAULT_BATCH_FILES
+    filepaths: list[str],
+    max_files: Annotated[int, Field(ge=1, le=MAX_BATCH_FILES)] = DEFAULT_BATCH_FILES,
+    max_bytes: Annotated[int, Field(ge=1, le=MAX_MAX_BATCH_BYTES)] | None = None,
+    max_file_bytes: Annotated[int, Field(ge=1, le=MAX_MAX_FILE_BYTES)] | None = None,
 ) -> dict:
-    """Read multiple text notes in one call. Output is bounded by ``max_files``."""
+    """Read multiple text notes in one call.
+
+    Output is bounded by ``max_files`` and by the total UTF-8 byte limit.
+    """
 
     limit = _clamp(max_files, 1, MAX_BATCH_FILES)
-    normalized = [normalize_vault_path(path) for path in filepaths]
-    return success(await api.get_batch_file_contents(normalized, max_files=limit))
+    selected = filepaths[:limit]
+    normalized = [normalize_vault_path(path) for path in selected]
+    total_limit = _batch_limit(max_bytes)
+    file_limit = _read_limit(max_file_bytes)
+    batch = await _read_batch(normalized, limit, max_bytes, max_file_bytes)
+
+    content = str(batch)
+    if len(filepaths) > len(selected):
+        content += (
+            f"# Batch truncated\n\nOnly the first {len(selected)} of "
+            f"{len(filepaths)} requested files were read.\n\n---\n\n"
+        )
+    bounded, post_truncated = truncate_utf8(content, total_limit)
+    metadata = getattr(batch, "metadata", {})
+    count_truncated = len(filepaths) > len(selected)
+    files_truncated = bool(metadata.get("files_truncated")) or count_truncated
+    file_content_truncated = bool(metadata.get("file_content_truncated"))
+    metadata_bytes = metadata.get("bytes_truncated")
+    if metadata_bytes is None:
+        metadata_bytes = bool(metadata.get("truncated")) and not bool(
+            metadata.get("files_truncated")
+        )
+    bytes_truncated = (
+        bool(metadata_bytes) or file_content_truncated or post_truncated
+    )
+    truncated = (
+        bytes_truncated
+        or bool(metadata.get("truncated"))
+        or files_truncated
+    )
+    return success(
+        bounded,
+        returned_bytes=utf8_len(bounded),
+        returned_characters=len(bounded),
+        max_bytes=total_limit,
+        max_file_bytes=file_limit,
+        files_returned=int(metadata.get("files_returned", len(normalized))),
+        max_files=limit,
+        files_truncated=files_truncated,
+        file_content_truncated=file_content_truncated,
+        truncated=truncated,
+        bytes_truncated=bytes_truncated,
+    )
 
 
 # ========================
@@ -283,14 +531,20 @@ async def batch_get_file_contents(
 @circuit_protected
 async def simple_search(
     query: str,
-    context_length: int = 100,
-    max_results: int = DEFAULT_SEARCH_RESULTS,
-    max_matches_per_file: int = DEFAULT_MATCHES_PER_FILE,
+    context_length: Annotated[int, Field(ge=1, le=500)] = 100,
+    max_results: Annotated[int, Field(ge=1, le=MAX_SEARCH_RESULTS)] = (
+        DEFAULT_SEARCH_RESULTS
+    ),
+    max_matches_per_file: Annotated[
+        int, Field(ge=1, le=MAX_MATCHES_PER_FILE)
+    ] = DEFAULT_MATCHES_PER_FILE,
+    max_bytes: Annotated[int, Field(ge=1, le=MAX_MAX_SEARCH_BYTES)] | None = None,
 ) -> dict:
     """Full-text search using Obsidian's built-in search.
 
     Results include filenames and match contexts. Limits are clamped to avoid
-    returning an unbounded amount of text to the model.
+    returning an unbounded amount of text to the model. The returned data is
+    also bounded by a total UTF-8 byte limit.
     """
 
     results_limit = _clamp(max_results, 1, MAX_SEARCH_RESULTS)
@@ -301,35 +555,82 @@ async def simple_search(
         max_results=results_limit,
         max_matches_per_file=matches_limit,
     )
-    returned = len(results) if isinstance(results, list) else 0
-    truncated = total > returned if total is not None else returned >= results_limit
+    metadata = _search_metadata(results, total, results_limit)
+    limit = _search_limit(max_bytes)
+    bounded, bytes_truncated = fit_json_to_bytes(results, limit)
+    if not isinstance(bounded, list):
+        bounded = []
+    bounded_metadata = _search_metadata(bounded, total, results_limit)
+    files_truncated = (
+        metadata["files_truncated"]
+        or bounded_metadata["returned"] < metadata["returned"]
+    )
+    matches_returned = bounded_metadata["matches_returned"]
+    matches_truncated = (
+        metadata["matches_truncated"]
+        or matches_returned < metadata["matches_returned"]
+    )
+    truncated = files_truncated or matches_truncated or bytes_truncated
     return success(
-        results,
-        returned=returned,
+        bounded,
+        returned=bounded_metadata["returned"],
         max_results=results_limit,
         total_results=total,
+        files_truncated=files_truncated,
+        total_matches=metadata["total_matches"],
+        matches_returned=matches_returned,
+        matches_truncated=matches_truncated,
+        returned_bytes=json_bytes(bounded),
+        returned_characters=json_characters(bounded),
+        max_bytes=limit,
+        bytes_truncated=bytes_truncated,
         truncated=truncated,
     )
 
 
 @mcp.tool()
 @circuit_protected
-async def complex_search(query: dict, max_results: int = 50) -> dict:
+async def complex_search(
+    query: dict,
+    max_results: Annotated[int, Field(ge=1, le=MAX_SEARCH_RESULTS)] = 50,
+    max_bytes: Annotated[int, Field(ge=1, le=MAX_MAX_SEARCH_BYTES)] | None = None,
+) -> dict:
     """Structured JSONLogic search against note metadata. Results are bounded."""
 
     limit = _clamp(max_results, 1, MAX_SEARCH_RESULTS)
+    byte_limit = _search_limit(max_bytes)
     results = await api.search_json(query)
     if isinstance(results, list):
-        truncated = len(results) > limit
-        returned_results = results[:limit]
+        selected = results[:limit]
+        bounded, bytes_truncated = fit_json_to_bytes(selected, byte_limit)
+        if not isinstance(bounded, list):
+            bounded = []
+        truncated = (
+            len(results) > limit
+            or len(bounded) < len(selected)
+            or bytes_truncated
+        )
         return success(
-            returned_results,
-            returned=len(returned_results),
+            bounded,
+            returned=len(bounded),
             max_results=limit,
+            returned_bytes=json_bytes(bounded),
+            returned_characters=json_characters(bounded),
+            max_bytes=byte_limit,
+            bytes_truncated=bytes_truncated,
             truncated=truncated,
         )
+
+    bounded, bytes_truncated = fit_json_to_bytes(results, byte_limit)
     return success(
-        results, returned=None, max_results=limit, truncated=False
+        bounded,
+        returned=None,
+        max_results=limit,
+        returned_bytes=json_bytes(bounded),
+        returned_characters=json_characters(bounded),
+        max_bytes=byte_limit,
+        bytes_truncated=bytes_truncated,
+        truncated=bytes_truncated,
     )
 
 
@@ -337,9 +638,14 @@ async def complex_search(query: dict, max_results: int = 50) -> dict:
 @circuit_protected
 async def search_and_summarize(
     query: str,
-    max_sources: int = DEFAULT_SUMMARY_SOURCES,
-    max_excerpts_per_source: int = DEFAULT_EXCERPTS_PER_SOURCE,
-    context_length: int = 100,
+    max_sources: Annotated[int, Field(ge=1, le=MAX_SUMMARY_SOURCES)] = (
+        DEFAULT_SUMMARY_SOURCES
+    ),
+    max_excerpts_per_source: Annotated[
+        int, Field(ge=1, le=MAX_EXCERPTS_PER_SOURCE)
+    ] = DEFAULT_EXCERPTS_PER_SOURCE,
+    context_length: Annotated[int, Field(ge=1, le=500)] = 100,
+    max_bytes: Annotated[int, Field(ge=1, le=MAX_MAX_SUMMARY_BYTES)] | None = None,
 ) -> dict:
     """Return relevant search excerpts grouped by source note.
 
@@ -358,40 +664,179 @@ async def search_and_summarize(
         max_results=sources_limit,
         max_matches_per_file=excerpts_limit,
     )
+    metadata = _search_metadata(results, total, sources_limit)
 
     sources: list[dict[str, Any]] = []
     for item in results[:sources_limit] if isinstance(results, list) else []:
         if not isinstance(item, dict):
             continue
-        filename = item.get("filename") or item.get("path") or "<unknown>"
-        matches = item.get("matches") or []
+        filename_value = item.get("filename") or item.get("path")
+        filename = (
+            filename_value
+            if isinstance(filename_value, str) and filename_value
+            else "<unknown>"
+        )
+        raw_matches = item.get("matches")
+        matches = raw_matches if isinstance(raw_matches, list) else []
+        valid_matches = [
+            match
+            for match in matches
+            if isinstance(match, dict)
+            and isinstance(match.get("context"), str)
+            and match["context"]
+        ]
         excerpts = [
-            match.get("context", "")
-            for match in matches[:excerpts_limit]
-            if isinstance(match, dict) and match.get("context")
+            match["context"] for match in valid_matches[:excerpts_limit]
         ]
         sources.append({"filename": filename, "excerpts": excerpts})
 
-    returned = len(results) if isinstance(results, list) else 0
-    source_count = total if total is not None else returned
-    truncated = source_count > len(sources) or (
-        total is None and returned >= sources_limit
-    )
+    source_count = total if total is not None else metadata["returned"]
+    selected_matches = sum(len(source["excerpts"]) for source in sources)
     summary = "\n\n".join(
         f"{source['filename']}: {excerpt}"
         for source in sources
         for excerpt in source["excerpts"]
-    )[:500]
-    return success(
-        {
-            "summary": summary,
-            "query": query,
-            "sources": sources,
-            "source_count": source_count,
-            "returned_sources": len(sources),
-            "truncated": truncated,
-            "note": "Excerpts from Obsidian search; no AI summary was generated.",
+    )
+    summary_character_truncated = len(summary) > 500
+    summary = summary[:500]
+    reported_limit = _summary_limit(max_bytes)
+    priority = [
+        "returned_bytes",
+        "truncated",
+        "max_bytes",
+        "bytes_truncated",
+        # Keep the size metadata and truncation flags ahead of the payloads
+        # they describe so a tight byte budget removes excerpts before it
+        # removes the reason they were shortened.
+        "returned_characters",
+        "summary_truncated",
+        "files_truncated",
+        "matches_truncated",
+        "summary",
+        "sources",
+        "source_count",
+        "returned_sources",
+        "total_matches",
+        "matches_returned",
+        "query",
+        "note",
+    ]
+    values = {
+        "summary": summary,
+        "query": query,
+        "sources": sources,
+        "source_count": source_count,
+        "returned_sources": len(sources),
+        "files_truncated": metadata["files_truncated"],
+        "total_matches": metadata["total_matches"],
+        "matches_returned": metadata["matches_returned"],
+        "matches_truncated": metadata["matches_truncated"],
+        "summary_truncated": summary_character_truncated,
+        "returned_bytes": 0,
+        "returned_characters": 0,
+        "max_bytes": reported_limit,
+        "bytes_truncated": False,
+        "truncated": metadata["truncated"] or summary_character_truncated,
+        "note": "Excerpts from Obsidian search; no AI summary was generated.",
+    }
+    data: dict[str, Any] = {key: values[key] for key in priority}
+    core_keys = {
+        "returned_bytes",
+        "truncated",
+    }
+
+    def stabilize(payload: dict[str, Any]) -> dict[str, Any]:
+        for _ in range(3):
+            size = json_bytes(payload)
+            characters = json_characters(payload)
+            if (
+                payload.get("returned_bytes") == size
+                and payload.get("returned_characters") == characters
+            ):
+                break
+            if "returned_bytes" in payload:
+                payload["returned_bytes"] = size
+            if "returned_characters" in payload:
+                payload["returned_characters"] = characters
+        return payload
+
+    bytes_truncated = False
+    summary_was_truncated = summary_character_truncated
+    for _ in range(4):
+        fitted, changed = fit_json_to_bytes(data, reported_limit)
+        if not isinstance(fitted, dict):
+            fitted = {}
+        fitted_sources = fitted.get("sources")
+        if not isinstance(fitted_sources, list):
+            fitted_sources = []
+        matches_returned = sum(
+            len(source.get("excerpts", []))
+            for source in fitted_sources
+            if isinstance(source, dict)
+            and isinstance(source.get("excerpts"), list)
+        )
+        files_truncated = (
+            metadata["files_truncated"] or source_count > len(fitted_sources)
+        )
+        matches_truncated = (
+            metadata["matches_truncated"] or matches_returned < selected_matches
+        )
+        reported_matches = metadata["matches_returned"]
+        if matches_returned < reported_matches:
+            reported_matches = matches_returned
+        fitted_summary = fitted.get("summary")
+        summary_truncated = (
+            summary_character_truncated
+            or not isinstance(fitted_summary, str)
+            or fitted_summary != summary
+        )
+        summary_was_truncated = summary_was_truncated or summary_truncated
+        bytes_truncated = bytes_truncated or changed
+        updates = {
+            "returned_sources": len(fitted_sources),
+            "files_truncated": files_truncated,
+            "matches_returned": reported_matches,
+            "matches_truncated": matches_truncated,
+            "summary_truncated": summary_truncated,
+            "returned_bytes": 0,
+            "returned_characters": 0,
+            "max_bytes": reported_limit,
+            "bytes_truncated": bytes_truncated,
+            "truncated": (
+                files_truncated
+                or matches_truncated
+                or bytes_truncated
+                or summary_truncated
+            ),
         }
+        for key, value in updates.items():
+            if key in fitted or key in core_keys:
+                fitted[key] = value
+        data = stabilize(fitted)
+        if json_bytes(data) <= reported_limit:
+            break
+        bytes_truncated = True
+        for key in reversed(priority):
+            if key in core_keys:
+                continue
+            if key in data and json_bytes(data) > reported_limit:
+                data.pop(key, None)
+        data = stabilize(data)
+        if json_bytes(data) <= reported_limit:
+            break
+
+    return success(
+        data,
+        returned_bytes=data.get("returned_bytes", json_bytes(data)),
+        returned_characters=data.get(
+            "returned_characters", json_characters(data)
+        ),
+        max_bytes=reported_limit,
+        bytes_truncated=data.get("bytes_truncated", True),
+        summary_truncated=data.get(
+            "summary_truncated", summary_was_truncated
+        ),
+        truncated=data.get("truncated", True),
     )
 
 
@@ -429,9 +874,9 @@ async def append_content(
 @circuit_protected
 async def patch_content(
     filepath: str,
-    operation: str,
-    target_type: str,
-    target: str | list[str],
+    operation: Literal["append", "prepend", "replace", "delete"],
+    target_type: Literal["heading", "block", "frontmatter"],
+    target: str | list[str] | None,
     content: str,
     if_match: str | None = None,
 ) -> dict:
@@ -439,7 +884,8 @@ async def patch_content(
 
     ``operation`` is one of append, prepend, replace, delete. ``target_type``
     is one of heading, block, frontmatter. For a heading, ``target`` may be a
-    string or a list of heading texts from the top level down. For frontmatter
+    string or a list of heading texts from the top level down. Use ``[]`` or
+    ``null`` to target the document root. For frontmatter
     append/prepend/replace, ``content`` is parsed as JSON when possible so
     values such as booleans, numbers, and lists are written with their native
     type.
@@ -478,12 +924,7 @@ async def delete_file(
 
     filepath = normalize_vault_path(input.filepath)
     if not confirm:
-        return error(
-            {
-                "status": "invalid_input",
-                "reason": "confirm must be true before deleting a note",
-            }
-        )
+        raise InputValidationError("confirm must be true before deleting a note")
 
     await api.delete_file(filepath, if_match=if_match)
     return success(f"Deleted {filepath}")
@@ -496,7 +937,9 @@ async def delete_file(
 
 @mcp.tool()
 @circuit_protected
-async def get_vault_stats(max_files: int = DEFAULT_STATS_FILES) -> dict:
+async def get_vault_stats(
+    max_files: Annotated[int, Field(ge=1, le=MAX_STATS_FILES)] = DEFAULT_STATS_FILES,
+) -> dict:
     """Summarise notes, link density, tags, and orphaned notes.
 
     Only Markdown notes are counted. The scan is bounded by ``max_files`` and
@@ -510,36 +953,69 @@ async def get_vault_stats(max_files: int = DEFAULT_STATS_FILES) -> dict:
     scanned = notes[:limit]
 
     concurrency = _env_int("OBSIDIAN_STATS_CONCURRENCY", 10, 1, 50)
-    semaphore = asyncio.Semaphore(concurrency)
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    for path in scanned:
+        queue.put_nowait(path)
 
-    async def read_note(path: str) -> tuple[str, str | None | Exception]:
-        async with semaphore:
+    contents: dict[str, str] = {}
+
+    async def read_worker() -> None:
+        while True:
             try:
-                return path, await api.get_file_contents(path)
-            except Exception as exc:
-                if is_service_failure(exc):
-                    return path, exc
-                logger.warning(
-                    "stats_file_read_failed",
-                    extra={
-                        "event": "stats_file_read_failed",
-                        "path": path,
-                        "status": getattr(exc, "status", type(exc).__name__),
-                    },
-                )
-                return path, None
+                path = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
 
-    pairs = await asyncio.gather(*(read_note(path) for path in scanned))
-    errors = [value for _, value in pairs if isinstance(value, Exception)]
-    if errors:
-        raise errors[0]
-    contents = {path: content for path, content in pairs if isinstance(content, str)}
+            try:
+                try:
+                    content = await api.get_file_contents(path)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if is_service_failure(exc):
+                        raise
+                    logger.warning(
+                        "stats_file_read_failed",
+                        extra={
+                            "event": "stats_file_read_failed",
+                            "path": path,
+                            "status": getattr(exc, "status", type(exc).__name__),
+                        },
+                    )
+                else:
+                    contents[path] = content
+            finally:
+                queue.task_done()
+
+    workers = [
+        asyncio.create_task(read_worker())
+        for _ in range(min(concurrency, len(scanned)))
+    ]
+    if workers:
+        try:
+            done, pending = await asyncio.wait(
+                workers, return_when=asyncio.FIRST_EXCEPTION
+            )
+        except asyncio.CancelledError:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+
+        if pending:
+            for worker in pending:
+                worker.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        errors = [
+            worker.exception()
+            for worker in done
+            if not worker.cancelled() and worker.exception() is not None
+        ]
+        if errors:
+            raise errors[0]
 
     stats = compute_vault_stats(files, contents, max_files=limit)
-    stats["notes_read"] = sum(
-        1 for _, content in pairs if isinstance(content, str)
-    )
-    stats["read_failures"] = len(pairs) - stats["notes_read"]
     return success(stats)
 
 
@@ -556,13 +1032,16 @@ async def check_connection() -> dict:
 
     try:
         files = await api.list_files_in_vault()
+        file_count = sum(
+            1 for path in files if not is_folder_entry(path)
+        )
         latency = round((time.monotonic() - started) * 1000, 2)
         circuit.record_success()
         return success(
             {
                 "status": "healthy",
                 "latency_ms": latency,
-                "file_count": len(files),
+                "file_count": file_count,
                 "host": api.base_url,
                 "circuit_state": circuit.state,
                 "circuit": circuit.snapshot(),
@@ -570,10 +1049,24 @@ async def check_connection() -> dict:
         )
     except Exception as exc:
         latency = round((time.monotonic() - started) * 1000, 2)
-        circuit.record_failure()
+        if is_circuit_failure(exc):
+            circuit.record_failure()
+        if not isinstance(exc, ObsidianMCPError):
+            logger.warning(
+                "health_check_failed",
+                extra={
+                    "event": "health_check_failed",
+                    "status": getattr(exc, "status", type(exc).__name__),
+                    "duration_ms": latency,
+                },
+                exc_info=exc,
+            )
+        # Auth and other client errors say nothing about service health, so
+        # leave the breaker untouched rather than counting them as failures.
         return error(
             {
                 "status": "unhealthy",
+                "error_status": getattr(exc, "status", "failed"),
                 "latency_ms": latency,
                 "reason": str(exc),
                 "host": api.base_url,

@@ -58,6 +58,16 @@ class CircuitBreaker:
         self.state = "CLOSED"
         self._half_open_probe_in_flight = False
 
+    def record_neutral(self) -> None:
+        """Release a probe slot without changing health state.
+
+        Local validation, authentication/client errors, and write conflicts are
+        not evidence that the service is healthy or unhealthy.  In particular,
+        they must not reset the failure count or close a half-open breaker.
+        """
+
+        self._half_open_probe_in_flight = False
+
     def record_failure(self) -> None:
         """Record a service failure and open the breaker when appropriate."""
 

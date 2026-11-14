@@ -45,5 +45,12 @@ def test_encoding_preserves_folders_and_encodes_specials():
     assert "/" in encoded
 
 
+def test_literal_percent_sequences_are_not_decoded():
+    # The raw path names a file whose name literally contains "%20".  The
+    # percent sign must be encoded once for the URL, not decoded to a space.
+    assert normalize_vault_path("folder/100%20.md") == "folder/100%20.md"
+    assert encode_vault_path("folder/100%20.md") == "folder/100%2520.md"
+
+
 def test_directory_encoding_has_single_trailing_slash():
     assert encode_vault_path("folder", is_dir=True) == "folder/"
