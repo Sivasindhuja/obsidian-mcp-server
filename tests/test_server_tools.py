@@ -17,6 +17,12 @@ from mcp_obsidian.errors import (
 )
 
 
+async def test_server_advertises_package_version(server):
+    from importlib.metadata import version
+
+    assert server.mcp.version == version("mcp-obsidian-sindhutsundupalli")
+
+
 async def test_tool_schemas_expose_enums_and_numeric_bounds(server):
     patch_tool = await server.mcp.get_tool("patch_content")
     patch_properties = patch_tool.parameters["properties"]

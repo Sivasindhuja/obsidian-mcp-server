@@ -405,9 +405,22 @@ class Obsidian:
 
     async def list_files_in_vault(self) -> Any:
         async def call():
-            response = await self.client.get("/vault/", headers=self._get_headers())
-            self._raise_for_status(response, "/vault/")
-            return response.json()["files"]
+            files: list[str] = []
+            pending = [""]
+            while pending:
+                dirpath = pending.pop(0)
+                path = self._url(dirpath, is_dir=True) if dirpath else "/vault/"
+                response = await self.client.get(path, headers=self._get_headers())
+                self._raise_for_status(response, path)
+                for entry in response.json()["files"]:
+                    if entry.endswith("/"):
+                        name = entry.rstrip("/")
+                        child = f"{dirpath}/{name}" if dirpath else name
+                        files.append(child + "/")
+                        pending.append(child)
+                    else:
+                        files.append(f"{dirpath}/{entry}" if dirpath else entry)
+            return files
 
         return await self._safe_call(call)
 

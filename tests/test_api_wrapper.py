@@ -598,6 +598,34 @@ async def test_batch_reports_per_file_content_truncation(api_client):
 
 
 @respx.mock
+async def test_list_files_in_vault_walks_subdirectories(api_client):
+    root = respx.get(f"{BASE}/vault/").mock(
+        return_value=httpx.Response(
+            200, json={"files": ["Folder/", "Root.md"]}
+        )
+    )
+    folder = respx.get(f"{BASE}/vault/Folder/").mock(
+        return_value=httpx.Response(
+            200, json={"files": ["Nested.md", "Sub/"]}
+        )
+    )
+    sub = respx.get(f"{BASE}/vault/Folder/Sub/").mock(
+        return_value=httpx.Response(200, json={"files": ["Deep.md"]})
+    )
+
+    assert await api_client.list_files_in_vault() == [
+        "Folder/",
+        "Root.md",
+        "Folder/Nested.md",
+        "Folder/Sub/",
+        "Folder/Sub/Deep.md",
+    ]
+    assert root.call_count == 1
+    assert folder.call_count == 1
+    assert sub.call_count == 1
+
+
+@respx.mock
 async def test_batch_expected_404_is_reported_inline(api_client):
     respx.get(f"{BASE}/vault/missing.md").mock(
         return_value=httpx.Response(404)

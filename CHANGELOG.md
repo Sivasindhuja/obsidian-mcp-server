@@ -21,6 +21,10 @@ All notable changes to this project are documented here. The project follows
 
 ### Fixed
 
+- Vault listing now traverses subdirectories instead of returning only the
+  vault root.
+- MCP server metadata now advertises the package version instead of the
+  FastMCP dependency version.
 - Folder entries are no longer counted as files.
 - Wiki-link resolution rejects unsafe path-like targets and no longer falls
   back to an unrelated basename.
@@ -46,8 +50,15 @@ All notable changes to this project are documented here. The project follows
 - Authentication and permission failures do not count as circuit-breaker
   failures.
 
+### Verified
+
+- GitHub Actions on Python 3.11, 3.12, and 3.13.
+- Clean wheel install, `mcp-obsidian` console entry point, and MCP stdio
+  lifecycle.
+- Docker image non-root execution and MCP stdio lifecycle.
+- Live disposable Obsidian vault with Local REST API 5.5.2: reads, search,
+  create, update, append, PATCH, delete, and conditional writes.
+
 ### Known limitations
 
 See the [Known limitations](README.md#known-limitations) section of the README.
-Live Obsidian API, Docker, and hosted CI verification must be completed for the
-release environment before publishing artifacts.

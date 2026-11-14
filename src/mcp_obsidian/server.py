@@ -8,6 +8,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from functools import wraps
+from importlib.metadata import PackageNotFoundError, version
 from typing import Annotated, Any, Literal
 
 from dotenv import load_dotenv
@@ -52,6 +53,11 @@ from mcp_obsidian.vault_stats import (  # noqa: E402
 )
 
 logger = logging.getLogger(__name__)
+
+try:
+    PACKAGE_VERSION = version("mcp-obsidian-sindhutsundupalli")
+except PackageNotFoundError:  # pragma: no cover - source checkout without install
+    PACKAGE_VERSION = "0.3.0"
 
 # ========================
 # CONFIGURATION
@@ -102,7 +108,7 @@ async def lifespan(_server: FastMCP):
         await api.aclose()
 
 
-mcp = FastMCP("obsidian-server", lifespan=lifespan)
+mcp = FastMCP("obsidian-server", version=PACKAGE_VERSION, lifespan=lifespan)
 
 
 # ========================
